@@ -121,6 +121,50 @@ affecting hit/miss counters or LRU ordering, use `cache_contains()`:
 The method returns `True` if the result for the given arguments is cached, `False`
 otherwise.
 
+Per-instance caches
+-------------------
+
+When an ``alru_cache`` decorates a class method, the default cache lives on the
+class: every instance shares it, and cached entries (which include the
+``self`` argument) keep every instance alive for the lifetime of the process.
+For long-running services that create many short-lived client-like objects this
+defeats normal garbage collection.
+
+Pass ``per_instance=True`` to give each instance an independent cache with its
+own capacity, hit/miss statistics and closed state:
+
+.. code-block:: python
+
+    class Client:
+        @alru_cache(maxsize=32, per_instance=True)
+        async def fetch(self, query):
+            ...
+
+Per-instance caches are keyed through weak references, so an instance with no
+external references is reclaimed together with its cache once it becomes idle.
+A method that is still running may keep ``self`` alive until it completes (the
+ordinary bound-method reference), but cache completion callbacks never
+resurrect a collected instance.
+
+Management methods are available on both the bound method and the class:
+
+.. code-block:: python
+
+    client.fetch.cache_info()           # stats for this instance only
+    await client.fetch.cache_close()    # close this instance's cache only
+
+    Client.fetch.cache_info()           # aggregate stats of live instances
+    Client.fetch.cache_clear()          # clear every live instance
+    await Client.fetch.cache_close()    # close every live instance
+    Client.fetch.cache_invalidate(client, 1)  # target one instance
+
+Because the registry of instance caches is keyed by the instance, instances
+must be hashable and support weak references. Classes that opt out (for example
+via ``__slots__`` without ``"__weakref__"``, or by setting ``__hash__ = None``)
+raise a clear ``TypeError`` at call time; cache entries are never keyed by
+``id()``, so recycled object ids cannot cause one instance to see another
+instance's entries.
+
 Custom cache keys
 -----------------
 

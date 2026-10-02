@@ -4,10 +4,11 @@ import inspect
 import random
 import sys
 import warnings
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine, Hashable
 from functools import _CacheInfo, _make_key, partial, partialmethod
-from typing import Any, Generic, TypedDict, TypeVar, cast, final, overload
+from typing import Any, Generic, Literal, TypedDict, TypeVar, cast, final, overload
 
 
 if sys.version_info >= (3, 11):
@@ -71,6 +72,7 @@ class _LRUCacheWrapper(Generic[_R]):
         "__misses",
         "__first_loop",
         "__warned_loop_reset",
+        "__instance_ref",
         "_is_coroutine",
         "_is_coroutine_marker",
         "__dict__",
@@ -84,6 +86,7 @@ class _LRUCacheWrapper(Generic[_R]):
         ttl: float | None,
         jitter: float | None,
         key: Callable[..., Hashable] | None = None,
+        instance_ref: "weakref.ref[Any] | None" = None,
     ) -> None:
         try:
             self.__module__ = fn.__module__
@@ -136,6 +139,7 @@ class _LRUCacheWrapper(Generic[_R]):
         self.__misses = 0
         self.__first_loop: asyncio.AbstractEventLoop | None = None
         self.__warned_loop_reset = False
+        self.__instance_ref = instance_ref
 
     @property
     def __tasks(self) -> list["asyncio.Task[_R]"]:
@@ -200,6 +204,16 @@ class _LRUCacheWrapper(Generic[_R]):
         for c in self.__cache.values():
             if c.later_call:
                 c.later_call.cancel()
+        self.__cache.clear()
+
+    def _discard_entries(self) -> None:
+        # Drop every entry without touching stats.  Used when the owning
+        # instance is garbage collected in per-instance mode: pending TTL
+        # handles are cancelled while in-flight tasks run to completion;
+        # their done callbacks then no-op against the emptied cache and
+        # cannot re-arm anything or resurrect the instance.
+        for cache_item in self.__cache.values():
+            cache_item.cancel()
         self.__cache.clear()
 
     async def cache_close(self, *, wait: bool = False) -> None:
@@ -299,7 +313,15 @@ class _LRUCacheWrapper(Generic[_R]):
             # If the task is already done, just return the result.
             return cache_item.task.result()
 
-        coro = self.__wrapped__(*fn_args, **fn_kwargs)
+        if self.__instance_ref is None:
+            coro = self.__wrapped__(*fn_args, **fn_kwargs)
+        else:
+            instance = self.__instance_ref()
+            if instance is None:
+                raise RuntimeError(
+                    "alru_cache bound instance was garbage collected"
+                )
+            coro = self.__wrapped__(instance, *fn_args, **fn_kwargs)
         task: asyncio.Task[_R] = loop.create_task(coro)
         task.add_done_callback(partial(self._task_done_callback, key))
 
@@ -416,12 +438,272 @@ class _LRUCacheWrapperInstanceMethod(Generic[_R, _T]):
         return await self.__wrapper(self.__instance, *fn_args, **fn_kwargs)
 
 
+def _copy_function_metadata(
+    source: Any, target: Any, wrapped: Any
+) -> None:
+    # Copy identity/introspection attributes from the wrapped function onto
+    # the wrapper/descriptor object.  Slot attributes are data descriptors
+    # and take precedence over the copied __dict__, so setting __wrapped__
+    # on ``target`` afterwards shadows any value copied from ``source``.
+    for name in (
+        "__module__",
+        "__name__",
+        "__qualname__",
+        "__doc__",
+    ):
+        try:
+            setattr(target, name, getattr(source, name))
+        except AttributeError:
+            pass
+    if sys.version_info >= (3, 14):
+        try:
+            target.__annotate__ = source.__annotate__
+        except AttributeError:
+            try:
+                target.__annotations__ = source.__annotations__
+            except AttributeError:
+                pass
+    else:
+        try:
+            target.__annotations__ = source.__annotations__
+        except AttributeError:
+            pass
+    try:
+        target.__dict__.update(source.__dict__)
+    except AttributeError:
+        pass
+    target.__wrapped__ = wrapped
+
+
+def _finalize_per_instance_cache(
+    cache: _LRUCacheWrapper[Any],
+) -> None:
+    cache._discard_entries()
+
+
+@final
+class _PerInstanceLRUCacheWrapperInstanceMethod(Generic[_R, _T]):
+    __slots__ = (
+        "__dict__",
+        "_is_coroutine",
+        "__wrapped__",
+        "__instance",
+        "__cache",
+    )
+
+    def __init__(
+        self,
+        cache: _LRUCacheWrapper[_R],
+        instance: _T,
+    ) -> None:
+        if sys.version_info < (3, 14):
+            self._is_coroutine = _is_coroutine
+        _copy_function_metadata(cache, self, cache.__wrapped__)
+        self.__cache = cache
+        self.__instance = instance
+
+    def cache_contains(self, /, *args: Hashable, **kwargs: Any) -> bool:
+        return self.__cache.cache_contains(*args, **kwargs)
+
+    def cache_invalidate(self, /, *args: Hashable, **kwargs: Any) -> bool:
+        return self.__cache.cache_invalidate(*args, **kwargs)
+
+    def cache_clear(self) -> None:
+        self.__cache.cache_clear()
+
+    async def cache_close(self, *, wait: bool = False) -> None:
+        await self.__cache.cache_close(wait=wait)
+
+    def cache_info(self) -> _CacheInfo:
+        return self.__cache.cache_info()
+
+    def cache_parameters(self) -> _CacheParameters:
+        return self.__cache.cache_parameters()
+
+    async def __call__(self, /, *fn_args: Any, **fn_kwargs: Any) -> _R:
+        return await self.__cache(*fn_args, **fn_kwargs)
+
+
+@final
+class _PerInstanceLRUCacheWrapper(Generic[_R]):
+    """Descriptor giving each instance its own independent cache.
+
+    Per-instance caches are held in a ``WeakKeyDictionary`` keyed by the
+    owner instance, so idle instances are reclaimed by normal garbage
+    collection rather than retained for the process lifetime.  Nothing
+    reachable from the cache state strongly references the instance while
+    it is idle; an in-flight coroutine is free to keep it alive via the
+    normal bound-method reference until it finishes.
+    """
+
+    __slots__ = (
+        "__wrapped__",
+        "__maxsize",
+        "__typed",
+        "__ttl",
+        "__jitter",
+        "__key",
+        "__caches",
+        "_is_coroutine",
+        "__dict__",
+    )
+
+    def __init__(
+        self,
+        fn: _CB[_R],
+        maxsize: int | None,
+        typed: bool,
+        ttl: float | None,
+        jitter: float | None,
+        key: Callable[..., Hashable] | None,
+    ) -> None:
+        if sys.version_info < (3, 14):
+            self._is_coroutine = _is_coroutine
+        _copy_function_metadata(fn, self, fn)
+        self.__maxsize = maxsize
+        self.__typed = typed
+        self.__ttl = ttl
+        self.__jitter = jitter
+        self.__key = key
+        self.__caches: "weakref.WeakKeyDictionary[Any, _LRUCacheWrapper[_R]]" = (
+            weakref.WeakKeyDictionary()
+        )
+
+    @staticmethod
+    def _check_instance(instance: Any) -> None:
+        # hash() first: an unhashable instance cannot key the registry.
+        try:
+            hash(instance)
+        except TypeError as exc:
+            raise TypeError(
+                "alru_cache(per_instance=True) requires hashable instances; "
+                f"got {instance!r}"
+            ) from exc
+        try:
+            weakref.ref(instance)
+        except TypeError as exc:
+            raise TypeError(
+                "alru_cache(per_instance=True) requires instances that "
+                f"support weak references; got {instance!r}"
+            ) from exc
+
+    def _get_cache(self, instance: Any) -> _LRUCacheWrapper[_R]:
+        cache = self.__caches.get(instance)
+        if cache is None:
+            cache = self._register(instance)
+        return cache
+
+    def _register(self, instance: Any) -> _LRUCacheWrapper[_R]:
+        instance_ref = weakref.ref(instance)
+        cache = _LRUCacheWrapper(
+            self.__wrapped__,
+            self.__maxsize,
+            self.__typed,
+            self.__ttl,
+            self.__jitter,
+            self.__key,
+            instance_ref=instance_ref,
+        )
+        self.__caches[instance] = cache
+        weakref.finalize(instance, _finalize_per_instance_cache, cache)
+        return cache
+
+    def _get_bound(
+        self, instance: Any
+    ) -> _PerInstanceLRUCacheWrapperInstanceMethod[_R, Any]:
+        self._check_instance(instance)
+        return _PerInstanceLRUCacheWrapperInstanceMethod(
+            self._get_cache(instance), instance
+        )
+
+    def cache_clear(self) -> None:
+        # Each instance keeps its own hit/miss counters and capacity;
+        # clearing from the class resets every live instance.
+        for cache in list(self.__caches.values()):
+            cache.cache_clear()
+
+    async def cache_close(self, *, wait: bool = False) -> None:
+        for cache in list(self.__caches.values()):
+            await cache.cache_close(wait=wait)
+
+    def cache_info(self) -> _CacheInfo:
+        caches = list(self.__caches.values())
+        return _CacheInfo(
+            hits=sum(c.cache_info().hits for c in caches),
+            misses=sum(c.cache_info().misses for c in caches),
+            maxsize=(
+                None
+                if self.__maxsize is None
+                else self.__maxsize * len(caches)
+            ),
+            currsize=sum(c.cache_info().currsize for c in caches),
+        )
+
+    def cache_parameters(self) -> _CacheParameters:
+        caches = list(self.__caches.values())
+        return _CacheParameters(
+            maxsize=self.__maxsize,
+            typed=self.__typed,
+            tasks=sum(c.cache_parameters()["tasks"] for c in caches),
+            closed=bool(caches)
+            and all(c.cache_parameters()["closed"] for c in caches),
+        )
+
+    def cache_invalidate(
+        self,
+        instance: Any | None = None,
+        /,
+        *args: Hashable,
+        **kwargs: Any,
+    ) -> bool:
+        if instance is None:
+            return any(
+                cache.cache_invalidate(*args, **kwargs)
+                for cache in self.__caches.values()
+            )
+        self._check_instance(instance)
+        cache = self.__caches.get(instance)
+        if cache is None:
+            return False
+        return cache.cache_invalidate(*args, **kwargs)
+
+    def cache_contains(
+        self,
+        instance: Any | None = None,
+        /,
+        *args: Hashable,
+        **kwargs: Any,
+    ) -> bool:
+        if instance is None:
+            return any(
+                cache.cache_contains(*args, **kwargs)
+                for cache in self.__caches.values()
+            )
+        self._check_instance(instance)
+        cache = self.__caches.get(instance)
+        return cache is not None and cache.cache_contains(*args, **kwargs)
+
+    async def __call__(
+        self, instance: Any, /, *fn_args: Any, **fn_kwargs: Any
+    ) -> _R:
+        self._check_instance(instance)
+        return await self._get_cache(instance)(*fn_args, **fn_kwargs)
+
+    def __get__(
+        self, instance: Any, owner: type | None
+    ) -> Self | _PerInstanceLRUCacheWrapperInstanceMethod[_R, Any]:
+        if instance is None:
+            return self
+        return self._get_bound(instance)
+
+
 def _make_wrapper(
     maxsize: int | None,
     typed: bool,
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    per_instance: bool = False,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]]:
     if jitter is not None and ttl is None:
         raise ValueError("jitter requires ttl to be set")
@@ -444,7 +726,17 @@ def _make_wrapper(
         if hasattr(fn, "_make_unbound_method"):
             fn = fn._make_unbound_method()
 
-        wrapper = _LRUCacheWrapper(cast(_CB[_R], fn), maxsize, typed, ttl, jitter, key)
+        if per_instance:
+            wrapper = cast(
+                _LRUCacheWrapper[_R],
+                _PerInstanceLRUCacheWrapper(
+                    cast(_CB[_R], fn), maxsize, typed, ttl, jitter, key
+                ),
+            )
+        else:
+            wrapper = _LRUCacheWrapper(
+                cast(_CB[_R], fn), maxsize, typed, ttl, jitter, key
+            )
         if sys.version_info >= (3, 12):
             wrapper = inspect.markcoroutinefunction(wrapper)
         return wrapper
@@ -460,7 +752,21 @@ def alru_cache(
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    per_instance: Literal[False] = False,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]]:
+    ...
+
+
+@overload
+def alru_cache(
+    maxsize: int | None = 128,
+    typed: bool = False,
+    *,
+    ttl: float | None = None,
+    jitter: float | None = None,
+    key: Callable[..., Hashable] | None = None,
+    per_instance: Literal[True],
+) -> Callable[[_CBP[_R]], _PerInstanceLRUCacheWrapper[_R]]:
     ...
 
 
@@ -479,13 +785,14 @@ def alru_cache(
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    per_instance: bool = False,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]] | _LRUCacheWrapper[_R]:
     if maxsize is None or isinstance(maxsize, int):
-        return _make_wrapper(maxsize, typed, ttl, jitter, key)
+        return _make_wrapper(maxsize, typed, ttl, jitter, key, per_instance)
     else:
         fn = cast(_CB[_R], maxsize)
 
         if callable(fn) or hasattr(fn, "_make_unbound_method"):
-            return _make_wrapper(128, False, None, None)(fn)
+            return _make_wrapper(128, False, None, None, None, per_instance)(fn)
 
         raise NotImplementedError(f"{fn!r} decorating is not supported")
