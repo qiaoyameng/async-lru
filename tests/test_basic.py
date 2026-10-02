@@ -167,6 +167,8 @@ async def test_alru_cache_parameters() -> None:
     assert coro.cache_parameters() == _CacheParameters(
         typed=False,
         maxsize=128,
+        inflight_limit=None,
+        queue_limit=None,
         tasks=0,
         closed=False,
     )
@@ -175,6 +177,8 @@ async def test_alru_cache_parameters() -> None:
     assert coro.cache_parameters() == _CacheParameters(
         typed=False,
         maxsize=128,
+        inflight_limit=None,
+        queue_limit=None,
         tasks=0,
         closed=False,
     )
@@ -194,6 +198,8 @@ async def test_alru_cache_method() -> None:
     assert a.coro.cache_parameters() == _CacheParameters(
         typed=False,
         maxsize=128,
+        inflight_limit=None,
+        queue_limit=None,
         tasks=0,
         closed=False,
     )
@@ -212,6 +218,8 @@ async def test_alru_cache_classmethod() -> None:
     assert A.coro.cache_parameters() == _CacheParameters(
         typed=False,
         maxsize=128,
+        inflight_limit=None,
+        queue_limit=None,
         tasks=0,
         closed=False,
     )

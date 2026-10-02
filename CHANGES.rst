@@ -5,6 +5,13 @@ CHANGES
 .. towncrier release notes start
 
 
+Unreleased
+==========
+
+- Added ``inflight_limit`` and ``queue_limit`` to bound concurrent computations and waiting keys.
+- Added ``ALRU_QUEUE_FULL``, returned when no computation or queue slot is available.
+
+
 2.3.0 (2026-03-18)
 ==================
 

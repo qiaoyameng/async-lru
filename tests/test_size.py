@@ -66,5 +66,5 @@ async def test_alru_cache_zero_max_size(check_lru: Callable[..., None]) -> None:
 
     ret = await asyncio.gather(*coros)
 
-    check_lru(coro, hits=0, misses=8, cache=0, tasks=0, maxsize=0)
+    check_lru(coro, hits=4, misses=4, cache=0, tasks=0, maxsize=0)
     assert ret == inputs

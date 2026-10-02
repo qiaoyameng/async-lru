@@ -90,6 +90,35 @@ With ``ttl=3600, jitter=1800``, each cache entry will have a random TTL
 between 3600 and 5400 seconds, spreading out invalidations over time.
 
 
+In-flight limits
+----------------
+
+``maxsize`` limits how many completed or running entries are retained, but it
+does not limit how many distinct wrapped coroutines may run concurrently. Use
+``inflight_limit`` to bound concurrent computation and ``queue_limit`` to bound
+how many distinct keys wait for an in-flight slot:
+
+.. code-block:: python
+
+    from async_lru import ALRU_QUEUE_FULL, alru_cache
+
+
+    @alru_cache(maxsize=128, inflight_limit=4, queue_limit=16)
+    async def fetch(key: str) -> bytes:
+        ...
+
+
+    result = await fetch("key")
+    if result is ALRU_QUEUE_FULL:
+        ...  # no computation or queue slot was available
+
+Concurrent calls with the same key share the existing in-flight or queued work.
+Queued calls do not start the wrapped coroutine until a slot is available. If
+both the in-flight and queue limits are reached for a new distinct key, the
+call returns the ``ALRU_QUEUE_FULL`` sentinel instead of raising. ``queue_limit``
+requires ``inflight_limit``.
+
+
 The library supports explicit invalidation for specific function call by
 `cache_invalidate()`:
 
