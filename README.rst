@@ -121,6 +121,33 @@ affecting hit/miss counters or LRU ordering, use `cache_contains()`:
 The method returns `True` if the result for the given arguments is cached, `False`
 otherwise.
 
+Recursive wait detection
+------------------------
+
+If a cached function (directly or through other cached functions) calls back
+into the same cache key that is still being computed, the callers would wait
+on each other forever. Pass ``detect_recursion=True`` to fail fast with an
+``AlruCacheRecursionError`` that shows the causal chain of decorated
+functions and their keys instead of deadlocking:
+
+.. code-block:: python
+
+    from async_lru import AlruCacheRecursionError, alru_cache
+
+    @alru_cache(detect_recursion=True)
+    async def func_a(key):
+        return await func_b(key)
+
+    @alru_cache(detect_recursion=True)
+    async def func_b(key):
+        return await func_a(key)  # raises AlruCacheRecursionError
+
+Detection follows the causal computation chain, so independent callers
+requesting the same key still share a single computation as usual. Cycles
+spanning multiple decorated functions are detected as long as each function
+in the cycle opts in. Chain state lives in the computation's context and is
+cleaned up automatically on exceptions, cancellation, and cache eviction.
+
 Custom cache keys
 -----------------
 

@@ -1,7 +1,9 @@
 import asyncio
+import contextvars
 import dataclasses
 import inspect
 import random
+import reprlib
 import sys
 import warnings
 from collections import OrderedDict
@@ -21,7 +23,7 @@ if sys.version_info < (3, 14):
 
 __version__ = "2.3.0"
 
-__all__ = ("AlruCacheLoopResetWarning", "alru_cache")
+__all__ = ("AlruCacheLoopResetWarning", "AlruCacheRecursionError", "alru_cache")
 
 
 _T = TypeVar("_T")
@@ -33,6 +35,60 @@ _CBP = _CB[_R] | partial[_Coro[_R]] | partialmethod[_Coro[_R]]
 
 class AlruCacheLoopResetWarning(UserWarning):
     """Emitted once per cache instance when a loop change triggers an auto-reset."""
+
+
+class AlruCacheRecursionError(RuntimeError):
+    """Raised when a cached call would recursively wait on its own call chain."""
+
+
+_ChainFrame = tuple["_LRUCacheWrapper[Any]", Hashable]
+
+# Causal chain of in-flight cached computations for the current context.
+# Each computation task copies this context on creation, so nested cached
+# calls see their ancestor frames while independent callers do not.
+_call_chain: contextvars.ContextVar[tuple[_ChainFrame, ...]] = contextvars.ContextVar(
+    "alru_cache_call_chain", default=()
+)
+
+# Bounded repr for diagnostic key rendering; never produces unbounded output.
+_key_repr = reprlib.Repr()
+_key_repr.maxlevel = 4
+_key_repr.maxstring = 64
+_key_repr.maxother = 64
+
+
+def _format_chain_frame(wrapper: "_LRUCacheWrapper[Any]", key: Hashable) -> str:
+    name = (
+        getattr(wrapper, "__qualname__", None)
+        or getattr(wrapper, "__name__", None)
+        or type(wrapper).__name__
+    )
+    try:
+        rendered_key = _key_repr.repr(key)
+    except Exception:
+        rendered_key = "<unrepresentable key>"
+    return f"{name}(key={rendered_key})"
+
+
+def _recursion_error(
+    chain: tuple[_ChainFrame, ...],
+    wrapper: "_LRUCacheWrapper[Any]",
+    key: Hashable,
+) -> AlruCacheRecursionError:
+    # Diagnostics must never mask the failure itself.
+    try:
+        frames = [_format_chain_frame(w, k) for w, k in chain]
+        frames.append(_format_chain_frame(wrapper, key))
+        message = (
+            "Recursive alru_cache wait detected; the call would wait on "
+            "its own computation chain:\n  " + "\n  -> ".join(frames)
+        )
+    except Exception:
+        message = (
+            "Recursive alru_cache wait detected "
+            "(call chain could not be rendered)"
+        )
+    return AlruCacheRecursionError(message)
 
 
 @final
@@ -71,6 +127,7 @@ class _LRUCacheWrapper(Generic[_R]):
         "__misses",
         "__first_loop",
         "__warned_loop_reset",
+        "__detect_recursion",
         "_is_coroutine",
         "_is_coroutine_marker",
         "__dict__",
@@ -84,6 +141,7 @@ class _LRUCacheWrapper(Generic[_R]):
         ttl: float | None,
         jitter: float | None,
         key: Callable[..., Hashable] | None = None,
+        detect_recursion: bool = False,
     ) -> None:
         try:
             self.__module__ = fn.__module__
@@ -136,6 +194,7 @@ class _LRUCacheWrapper(Generic[_R]):
         self.__misses = 0
         self.__first_loop: asyncio.AbstractEventLoop | None = None
         self.__warned_loop_reset = False
+        self.__detect_recursion = detect_recursion
 
     @property
     def __tasks(self) -> list["asyncio.Task[_R]"]:
@@ -239,6 +298,12 @@ class _LRUCacheWrapper(Generic[_R]):
     def _cache_miss(self, key: Hashable) -> None:
         self.__misses += 1
 
+    def _check_recursive_wait(self, key: Hashable) -> None:
+        chain = _call_chain.get()
+        for frame_wrapper, frame_key in chain:
+            if frame_wrapper is self and frame_key == key:
+                raise _recursion_error(chain, self, key)
+
     def _task_done_callback(self, key: Hashable, task: "asyncio.Task[_R]") -> None:
         # We must use the private attribute instead of `exception()`
         # so asyncio does not set `task.__log_traceback = False` on
@@ -290,6 +355,8 @@ class _LRUCacheWrapper(Generic[_R]):
         cache_item = self.__cache.get(key)
 
         if cache_item is not None:
+            if self.__detect_recursion and not cache_item.task.done():
+                self._check_recursive_wait(key)
             self._cache_hit(key)
             if not cache_item.task.done():
                 # Each logical waiter increments waiters on entry.
@@ -299,8 +366,23 @@ class _LRUCacheWrapper(Generic[_R]):
             # If the task is already done, just return the result.
             return cache_item.task.result()
 
+        if self.__detect_recursion:
+            # A miss with the same (wrapper, key) still on the causal chain
+            # (e.g. the ancestor entry was evicted) would recurse forever.
+            self._check_recursive_wait(key)
+
         coro = self.__wrapped__(*fn_args, **fn_kwargs)
-        task: asyncio.Task[_R] = loop.create_task(coro)
+        if self.__detect_recursion:
+            # The computation task copies the current context, so nested
+            # cached calls observe this frame; the caller's own context is
+            # restored immediately and never retains chain state.
+            token = _call_chain.set(_call_chain.get() + ((self, key),))
+            try:
+                task: asyncio.Task[_R] = loop.create_task(coro)
+            finally:
+                _call_chain.reset(token)
+        else:
+            task = loop.create_task(coro)
         task.add_done_callback(partial(self._task_done_callback, key))
 
         cache_item = _CacheItem(task, None, 1)
@@ -422,6 +504,7 @@ def _make_wrapper(
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    detect_recursion: bool = False,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]]:
     if jitter is not None and ttl is None:
         raise ValueError("jitter requires ttl to be set")
@@ -444,7 +527,9 @@ def _make_wrapper(
         if hasattr(fn, "_make_unbound_method"):
             fn = fn._make_unbound_method()
 
-        wrapper = _LRUCacheWrapper(cast(_CB[_R], fn), maxsize, typed, ttl, jitter, key)
+        wrapper = _LRUCacheWrapper(
+            cast(_CB[_R], fn), maxsize, typed, ttl, jitter, key, detect_recursion
+        )
         if sys.version_info >= (3, 12):
             wrapper = inspect.markcoroutinefunction(wrapper)
         return wrapper
@@ -460,6 +545,7 @@ def alru_cache(
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    detect_recursion: bool = False,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]]:
     ...
 
@@ -479,9 +565,10 @@ def alru_cache(
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    detect_recursion: bool = False,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]] | _LRUCacheWrapper[_R]:
     if maxsize is None or isinstance(maxsize, int):
-        return _make_wrapper(maxsize, typed, ttl, jitter, key)
+        return _make_wrapper(maxsize, typed, ttl, jitter, key, detect_recursion)
     else:
         fn = cast(_CB[_R], maxsize)
 

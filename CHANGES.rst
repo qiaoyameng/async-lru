@@ -5,6 +5,14 @@ CHANGES
 .. towncrier release notes start
 
 
+Unreleased
+==================
+
+- Added optional ``detect_recursion`` parameter that raises
+  ``AlruCacheRecursionError`` with the causal call chain when a cached call
+  would recursively wait on its own computation.
+
+
 2.3.0 (2026-03-18)
 ==================
 
