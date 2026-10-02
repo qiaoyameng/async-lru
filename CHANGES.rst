@@ -5,6 +5,16 @@ CHANGES
 .. towncrier release notes start
 
 
+2.3.1 (UNRELEASED)
+==================
+
+- Added ``per_instance=True`` to ``alru_cache`` for methods, giving each
+  instance its own capacity, statistics and closed state without keeping
+  idle instances alive. Per-instance caches are keyed by object identity via
+  weak references; non-weak-referenceable instances raise a clear
+  ``TypeError`` and recycled instances can never leak entries to a new object.
+
+
 2.3.0 (2026-03-18)
 ==================
 

@@ -147,6 +147,53 @@ instance as its first argument. Passing ``typed=True`` together with ``key``
 raises ``ValueError``, since ``typed`` only affects the default key
 computation.
 
+Per-instance caching
+--------------------
+
+By default a decorated method keeps one cache on the class-level
+decorator, and that cache's keys include ``self``. The cache therefore
+holds a strong reference to every instance it has seen, so short-lived
+objects in a long-running service are never garbage collected.
+
+Pass ``per_instance=True`` to give each instance its own cache instead:
+
+.. code-block:: python
+
+    class Client:
+        @alru_cache(per_instance=True)
+        async def fetch(self, url):
+            ...
+
+Each instance gets an independent capacity, hit/miss statistics and
+closed state. The decorator is held on the class only through a weak
+reference, so once an instance is idle (no external references and no
+method call in flight) it is garbage collected together with its cache.
+A method call that is still running may keep its instance alive until
+it finishes; no cache callback keeps it alive afterwards.
+
+Management is still available both through the bound method (acting on
+that instance only) and through the class-level decorator (acting on all
+live instances, or aggregating their statistics):
+
+.. code-block:: python
+
+    client = Client()
+    await client.fetch("/a")
+    client.fetch.cache_info()          # stats for this instance only
+    await client.fetch.cache_close()   # close this instance only
+
+    Client.fetch.cache_info()          # aggregated over live instances
+    Client.fetch.cache_clear()         # clear every live instance cache
+    await Client.fetch.cache_close()   # close all instances
+    Client.fetch.cache_invalidate(client, "/a")
+
+The per-instance registry keys instances by identity (not by ``id()``
+and not by ``__hash__``/``__eq__``), so unhashable instances are
+supported and a garbage-collected instance can never leak its cache to
+a new object that reuses the same memory address. Instances that do not
+support weak references (for example classes using ``__slots__`` without
+a ``__weakref__`` slot) raise a clear ``TypeError`` when accessed.
+
 Limitations
 -----------
 
