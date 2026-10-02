@@ -4,7 +4,7 @@ import inspect
 import random
 import sys
 import warnings
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable, Coroutine, Hashable
 from functools import _CacheInfo, _make_key, partial, partialmethod
 from typing import Any, Generic, TypedDict, TypeVar, cast, final, overload
@@ -21,7 +21,7 @@ if sys.version_info < (3, 14):
 
 __version__ = "2.3.0"
 
-__all__ = ("AlruCacheLoopResetWarning", "alru_cache")
+__all__ = ("AlruCacheLoopResetWarning", "AlruCacheQueueFull", "alru_cache")
 
 
 _T = TypeVar("_T")
@@ -35,6 +35,10 @@ class AlruCacheLoopResetWarning(UserWarning):
     """Emitted once per cache instance when a loop change triggers an auto-reset."""
 
 
+class AlruCacheQueueFull(Exception):
+    """Raised when the wait queue for in-flight computation slots is full."""
+
+
 @final
 class _CacheParameters(TypedDict):
     typed: bool
@@ -46,9 +50,16 @@ class _CacheParameters(TypedDict):
 @final
 @dataclasses.dataclass(slots=True)
 class _CacheItem(Generic[_R]):
-    task: "asyncio.Task[_R]"
+    task: "asyncio.Task[_R] | None"
     later_call: asyncio.Handle | None
     waiters: int
+    # Fields below are only used while the item waits for an in-flight
+    # computation slot; the wrapped coroutine is not created yet.
+    pending: "asyncio.Future[None] | None" = None
+    queued: bool = False
+    key: Hashable | None = None
+    fn_args: "tuple[Any, ...] | None" = None
+    fn_kwargs: "dict[str, Any] | None" = None
 
     def cancel(self) -> None:
         if self.later_call is not None:
@@ -65,6 +76,10 @@ class _LRUCacheWrapper(Generic[_R]):
         "__ttl",
         "__jitter",
         "__key",
+        "__max_inflight",
+        "__max_queue",
+        "__inflight",
+        "__queue",
         "__cache",
         "__closed",
         "__hits",
@@ -84,6 +99,8 @@ class _LRUCacheWrapper(Generic[_R]):
         ttl: float | None,
         jitter: float | None,
         key: Callable[..., Hashable] | None = None,
+        max_inflight: int | None = None,
+        max_queue: int | None = None,
     ) -> None:
         try:
             self.__module__ = fn.__module__
@@ -130,6 +147,10 @@ class _LRUCacheWrapper(Generic[_R]):
         self.__ttl = ttl
         self.__jitter = jitter
         self.__key = key
+        self.__max_inflight = max_inflight
+        self.__max_queue = max_queue
+        self.__inflight = 0
+        self.__queue: deque[_CacheItem[_R]] = deque()
         self.__cache: OrderedDict[Hashable, _CacheItem[_R]] = OrderedDict()
         self.__closed = False
         self.__hits = 0
@@ -145,7 +166,7 @@ class _LRUCacheWrapper(Generic[_R]):
             {
                 cache_item.task
                 for cache_item in self.__cache.values()
-                if not cache_item.task.done()
+                if cache_item.task is not None and not cache_item.task.done()
             }
         )
 
@@ -205,6 +226,16 @@ class _LRUCacheWrapper(Generic[_R]):
     async def cache_close(self, *, wait: bool = False) -> None:
         self.__closed = True
 
+        # Reject queued items that never got a computation slot; their
+        # waiters are unblocked with CancelledError.
+        for cache_item in self.__queue:
+            cache_item.queued = False
+            pending = cache_item.pending
+            cache_item.pending = None
+            if pending is not None and not pending.done():
+                pending.cancel()
+        self.__queue.clear()
+
         tasks = self.__tasks
         if not tasks:
             return
@@ -240,6 +271,13 @@ class _LRUCacheWrapper(Generic[_R]):
         self.__misses += 1
 
     def _task_done_callback(self, key: Hashable, task: "asyncio.Task[_R]") -> None:
+        # The in-flight slot is released only now, when the task has
+        # actually finished (or its cancellation cleanup has completed);
+        # cache eviction alone never releases it.
+        if self.__max_inflight is not None:
+            self.__inflight -= 1
+            self._pump_queue()
+
         # We must use the private attribute instead of `exception()`
         # so asyncio does not set `task.__log_traceback = False` on
         # the false assumption that the caller read the task Exception
@@ -257,17 +295,74 @@ class _LRUCacheWrapper(Generic[_R]):
                 effective_ttl, self.__cache.pop, key, None
             )
 
+    def _pump_queue(self) -> None:
+        limit = self.__max_inflight
+        if limit is None:
+            return
+        while self.__queue and self.__inflight < limit:
+            cache_item = self.__queue.popleft()
+            cache_item.queued = False
+            pending = cache_item.pending
+            cache_item.pending = None
+            if pending is None or pending.done():
+                # All waiters went away while queued; skip.
+                continue
+            fn_args = cache_item.fn_args or ()
+            fn_kwargs = cache_item.fn_kwargs or {}
+            cache_item.fn_args = None
+            cache_item.fn_kwargs = None
+            # The business coroutine is created only now, once the item
+            # has been granted an in-flight computation slot.
+            coro = self.__wrapped__(*fn_args, **fn_kwargs)
+            loop = asyncio.get_running_loop()
+            task: asyncio.Task[_R] = loop.create_task(coro)
+            task.add_done_callback(partial(self._task_done_callback, cache_item.key))
+            cache_item.task = task
+            self.__inflight += 1
+            pending.set_result(None)
+
+    def _discard_queued(self, cache_item: _CacheItem[_R]) -> None:
+        if not cache_item.queued:
+            return
+        cache_item.queued = False
+        pending = cache_item.pending
+        cache_item.pending = None
+        if pending is not None and not pending.done():
+            pending.cancel()
+        # Remove by identity; other entries may compare equal.
+        self.__queue = deque(
+            item for item in self.__queue if item is not cache_item
+        )
+
     async def _shield_and_handle_cancelled_error(
         self, cache_item: _CacheItem[_T], key: Hashable
     ) -> _T:
-        task = cache_item.task
         try:
+            task = cache_item.task
+            if task is None:
+                # Queued, waiting for an in-flight computation slot.
+                pending = cache_item.pending
+                assert pending is not None
+                try:
+                    # Shielded so one waiter's cancellation does not
+                    # cancel the shared grant future.
+                    await asyncio.shield(pending)
+                except asyncio.CancelledError:
+                    # Cancelled while queued (by the caller, or by
+                    # cache_close/cache eviction rejecting the entry).
+                    if cache_item.waiters == 1 and cache_item.task is None:
+                        self._discard_queued(cache_item)
+                        self.__cache.pop(key, None)
+                    raise
+                task = cache_item.task
+                assert task is not None
             # All waiters await the same shielded task.
             return await asyncio.shield(task)
         except asyncio.CancelledError:
             # If this is the last waiter and the underlying task is not done,
             # cancel the underlying task and remove the cache entry.
-            if cache_item.waiters == 1 and not task.done():
+            task = cache_item.task
+            if cache_item.waiters == 1 and task is not None and not task.done():
                 cache_item.cancel()  # Cancel TTL expiration
                 task.cancel()  # Cancel the running coroutine
                 self.__cache.pop(key, None)  # Remove from cache
@@ -291,19 +386,41 @@ class _LRUCacheWrapper(Generic[_R]):
 
         if cache_item is not None:
             self._cache_hit(key)
-            if not cache_item.task.done():
+            task = cache_item.task
+            if task is None or not task.done():
+                # Queued or running: merge with the existing work
+                # without taking another in-flight slot.
                 # Each logical waiter increments waiters on entry.
                 cache_item.waiters += 1
                 return await self._shield_and_handle_cancelled_error(cache_item, key)
 
             # If the task is already done, just return the result.
-            return cache_item.task.result()
+            return task.result()
 
-        coro = self.__wrapped__(*fn_args, **fn_kwargs)
-        task: asyncio.Task[_R] = loop.create_task(coro)
-        task.add_done_callback(partial(self._task_done_callback, key))
+        if self.__max_inflight is not None and self.__inflight >= self.__max_inflight:
+            # No in-flight slot available: queue the call without
+            # creating the business coroutine yet.
+            if self.__max_queue is not None and len(self.__queue) >= self.__max_queue:
+                self._cache_miss(key)
+                raise AlruCacheQueueFull(
+                    f"alru_cache wait queue is full (max_queue={self.__max_queue}) "
+                    f"for {self}"
+                )
+            cache_item = _CacheItem(None, None, 1)
+            cache_item.queued = True
+            cache_item.pending = loop.create_future()
+            cache_item.key = key
+            cache_item.fn_args = fn_args
+            cache_item.fn_kwargs = fn_kwargs
+            self.__queue.append(cache_item)
+        else:
+            coro = self.__wrapped__(*fn_args, **fn_kwargs)
+            task = loop.create_task(coro)
+            task.add_done_callback(partial(self._task_done_callback, key))
+            if self.__max_inflight is not None:
+                self.__inflight += 1
+            cache_item = _CacheItem(task, None, 1)
 
-        cache_item = _CacheItem(task, None, 1)
         self.__cache[key] = cache_item
 
         if self.__maxsize is not None and len(self.__cache) > self.__maxsize:
@@ -422,11 +539,19 @@ def _make_wrapper(
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    max_inflight: int | None = None,
+    max_queue: int | None = None,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]]:
     if jitter is not None and ttl is None:
         raise ValueError("jitter requires ttl to be set")
     if jitter is not None and jitter < 0:
         raise ValueError("jitter must be non-negative")
+    if max_inflight is not None and max_inflight < 1:
+        raise ValueError("max_inflight must be a positive integer or None")
+    if max_queue is not None and max_inflight is None:
+        raise ValueError("max_queue requires max_inflight to be set")
+    if max_queue is not None and max_queue < 0:
+        raise ValueError("max_queue must be a non-negative integer or None")
     if key is not None and not callable(key):
         raise TypeError("key must be callable")
     if key is not None and typed:
@@ -444,7 +569,16 @@ def _make_wrapper(
         if hasattr(fn, "_make_unbound_method"):
             fn = fn._make_unbound_method()
 
-        wrapper = _LRUCacheWrapper(cast(_CB[_R], fn), maxsize, typed, ttl, jitter, key)
+        wrapper = _LRUCacheWrapper(
+            cast(_CB[_R], fn),
+            maxsize,
+            typed,
+            ttl,
+            jitter,
+            key,
+            max_inflight,
+            max_queue,
+        )
         if sys.version_info >= (3, 12):
             wrapper = inspect.markcoroutinefunction(wrapper)
         return wrapper
@@ -460,6 +594,8 @@ def alru_cache(
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    max_inflight: int | None = None,
+    max_queue: int | None = None,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]]:
     ...
 
@@ -479,9 +615,11 @@ def alru_cache(
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    max_inflight: int | None = None,
+    max_queue: int | None = None,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]] | _LRUCacheWrapper[_R]:
     if maxsize is None or isinstance(maxsize, int):
-        return _make_wrapper(maxsize, typed, ttl, jitter, key)
+        return _make_wrapper(maxsize, typed, ttl, jitter, key, max_inflight, max_queue)
     else:
         fn = cast(_CB[_R], maxsize)
 

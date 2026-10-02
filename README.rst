@@ -90,6 +90,27 @@ With ``ttl=3600, jitter=1800``, each cache entry will have a random TTL
 between 3600 and 5400 seconds, spreading out invalidations over time.
 
 
+While ``maxsize`` bounds how many results are kept in the cache, it does
+not bound how many distinct keys are computed at the same time. Use
+``max_inflight`` to cap the number of concurrently running computations
+(off by default) and ``max_queue`` to bound how many calls may wait for
+a computation slot (unbounded by default, requires ``max_inflight``):
+
+.. code-block:: python
+
+    @alru_cache(maxsize=128, max_inflight=2, max_queue=8)
+    async def func(arg):
+        return arg * 2
+
+Calls for a key that is already being computed (or is already queued)
+merge with the existing work and never take an extra slot. Calls beyond
+``max_inflight`` are queued without creating the wrapped coroutine until
+a slot is granted; a slot is released only when the computation actually
+finishes (or its cancellation cleanup completes), not when its cache
+entry is evicted. When the wait queue is full, the call is rejected by
+raising ``AlruCacheQueueFull``.
+
+
 The library supports explicit invalidation for specific function call by
 `cache_invalidate()`:
 

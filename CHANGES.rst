@@ -5,6 +5,10 @@ CHANGES
 .. towncrier release notes start
 
 
+- Added ``max_inflight`` to cap concurrent computations and ``max_queue``
+  to bound the wait queue; excess calls raise ``AlruCacheQueueFull``.
+
+
 2.3.0 (2026-03-18)
 ==================
 
