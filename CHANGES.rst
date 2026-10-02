@@ -5,6 +5,17 @@ CHANGES
 .. towncrier release notes start
 
 
+Unreleased
+==========
+
+- Added an optional ``signature_key`` mode that normalizes cache keys against
+  the wrapped function signature, so positional/keyword spellings of the same
+  call (including defaults, ``*args``, ``**kwargs`` and bound methods) share
+  one cache entry. Invalid calls raise the same ``TypeError`` as the wrapped
+  function, and ``cache_contains()``/``cache_invalidate()`` use the same
+  normalized identity. ``cache_parameters()`` now includes ``signature_key``.
+
+
 2.3.0 (2026-03-18)
 ==================
 

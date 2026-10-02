@@ -147,6 +147,50 @@ instance as its first argument. Passing ``typed=True`` together with ``key``
 raises ``ValueError``, since ``typed`` only affects the default key
 computation.
 
+Signature-normalized cache keys
+-------------------------------
+
+By default a cache key also records *how* arguments were passed, so
+``func(1)`` and ``func(x=1)`` are stored as different entries even when
+``x`` has a default value of ``1``. Pass ``signature_key=True`` to
+normalize every call against the wrapped function's signature
+(``inspect.signature``) instead. Positional-only, positional-or-keyword,
+keyword-only, ``*args``, ``**kwargs``, default values and bound methods
+are all handled:
+
+.. code-block:: python
+
+    @alru_cache(signature_key=True)
+    async def func(x, mode="a", **extra):
+        ...
+
+    await func(1)
+    await func(x=1)
+    await func(1, mode="a")
+    await func(1, mode="a", z=9, y=8)
+    await func(x=1, y=8, z=9)  # keyword order is normalized too
+
+    # The first three calls share one entry; the last two share another.
+
+    func.cache_invalidate(x=1)  # removes the entry created by func(1)
+
+Under the hood each call is bound with ``Signature.bind`` and
+``apply_defaults()``, so explicit arguments and defaults produce the same
+key and keyword spelling (including captured ``**kwargs``) is order
+independent. Invalid calls raise exactly the same ``TypeError`` the
+wrapped function would raise (same arity/duplicated/unknown argument
+messages); ``cache_contains()`` and ``cache_invalidate()`` validate the
+same way. As with ``functools.lru_cache``, key arguments must be
+hashable and mutable defaults are *not* stringified into stable keys --
+using them raises ``TypeError``. ``typed=True`` keeps working and keeps
+``True``/``1`` in distinct type buckets exactly like the default key
+computation. ``cache_parameters()`` reports ``signature_key`` for the
+active wrapper.
+
+``signature_key`` cannot be combined with a custom ``key`` callable: a
+custom key defines cache identity by itself, so combining them raises
+``ValueError``. The signature is resolved once, at decoration time.
+
 Limitations
 -----------
 

@@ -166,6 +166,7 @@ async def test_alru_cache_parameters() -> None:
 
     assert coro.cache_parameters() == _CacheParameters(
         typed=False,
+        signature_key=False,
         maxsize=128,
         tasks=0,
         closed=False,
@@ -174,6 +175,7 @@ async def test_alru_cache_parameters() -> None:
     await coro(1)
     assert coro.cache_parameters() == _CacheParameters(
         typed=False,
+        signature_key=False,
         maxsize=128,
         tasks=0,
         closed=False,
@@ -193,6 +195,7 @@ async def test_alru_cache_method() -> None:
     assert await a.coro() == 42
     assert a.coro.cache_parameters() == _CacheParameters(
         typed=False,
+        signature_key=False,
         maxsize=128,
         tasks=0,
         closed=False,
@@ -211,6 +214,7 @@ async def test_alru_cache_classmethod() -> None:
     assert await A.coro(5) == 8
     assert A.coro.cache_parameters() == _CacheParameters(
         typed=False,
+        signature_key=False,
         maxsize=128,
         tasks=0,
         closed=False,

@@ -38,6 +38,7 @@ class AlruCacheLoopResetWarning(UserWarning):
 @final
 class _CacheParameters(TypedDict):
     typed: bool
+    signature_key: bool
     maxsize: int | None
     tasks: int
     closed: bool
@@ -65,6 +66,7 @@ class _LRUCacheWrapper(Generic[_R]):
         "__ttl",
         "__jitter",
         "__key",
+        "__signature",
         "__cache",
         "__closed",
         "__hits",
@@ -84,6 +86,7 @@ class _LRUCacheWrapper(Generic[_R]):
         ttl: float | None,
         jitter: float | None,
         key: Callable[..., Hashable] | None = None,
+        signature: inspect.Signature | None = None,
     ) -> None:
         try:
             self.__module__ = fn.__module__
@@ -130,6 +133,7 @@ class _LRUCacheWrapper(Generic[_R]):
         self.__ttl = ttl
         self.__jitter = jitter
         self.__key = key
+        self.__signature = signature
         self.__cache: OrderedDict[Hashable, _CacheItem[_R]] = OrderedDict()
         self.__closed = False
         self.__hits = 0
@@ -167,24 +171,45 @@ class _LRUCacheWrapper(Generic[_R]):
             self.cache_clear()
             self.__first_loop = loop
 
+    def _make_key(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Hashable:
+        if self.__key is not None:
+            return self.__key(*args, **kwargs)
+        if self.__signature is not None:
+            # Bind the call against the wrapped signature so that
+            # positional/keyword spellings of the same call collapse to
+            # one entry; ``apply_defaults`` fills in omitted defaults so
+            # explicit and implicit defaults produce the same key.
+            try:
+                bound = self.__signature.bind(*args, **kwargs)
+            except TypeError:
+                # ``Signature.bind`` formulates some messages
+                # differently from a real call (e.g. missing required
+                # arguments); re-run the native argument binding by
+                # invoking the wrapped function and let its TypeError
+                # propagate.  Invalid calls fail while the coroutine is
+                # still being created, so no coroutine object leaks.
+                self.__wrapped__(*args, **kwargs)
+                raise  # pragma: no cover  # native bind cannot succeed
+            bound.apply_defaults()
+
+            # Keyword spellings (including captured ``**kwargs``) must
+            # not depend on the order the caller happened to use.
+            normalized_kwargs = dict(
+                sorted(bound.kwargs.items(), key=lambda item: item[0])
+            )
+            return _make_key(bound.args, normalized_kwargs, self.__typed)
+        return _make_key(args, kwargs, self.__typed)
+
     def cache_contains(self, /, *args: Hashable, **kwargs: Any) -> bool:
         """Check if the given arguments are in the cache.
 
         Does not affect hit/miss counters or LRU ordering.
         """
-        # Inlined instead of a shared helper: an extra method call is
-        # measurable on these short code paths (CodSpeed).
-        if self.__key is not None:
-            key = self.__key(*args, **kwargs)
-        else:
-            key = _make_key(args, kwargs, self.__typed)
+        key = self._make_key(args, kwargs)
         return key in self.__cache
 
     def cache_invalidate(self, /, *args: Hashable, **kwargs: Any) -> bool:
-        if self.__key is not None:
-            key = self.__key(*args, **kwargs)
-        else:
-            key = _make_key(args, kwargs, self.__typed)
+        key = self._make_key(args, kwargs)
 
         cache_item = self.__cache.pop(key, None)
         if cache_item is None:
@@ -228,6 +253,7 @@ class _LRUCacheWrapper(Generic[_R]):
         return _CacheParameters(
             maxsize=self.__maxsize,
             typed=self.__typed,
+            signature_key=self.__signature is not None,
             tasks=len(self.__tasks),
             closed=self.__closed,
         )
@@ -283,10 +309,10 @@ class _LRUCacheWrapper(Generic[_R]):
         loop = asyncio.get_running_loop()
         self._check_loop(loop)
 
-        if self.__key is not None:
-            key = self.__key(*fn_args, **fn_kwargs)
-        else:
-            key = _make_key(fn_args, fn_kwargs, self.__typed)
+        # In signature mode ``_make_key`` also validates the call
+        # against the wrapped signature and raises the native TypeError
+        # for invalid arguments before anything is scheduled.
+        key = self._make_key(fn_args, fn_kwargs)
         cache_item = self.__cache.get(key)
 
         if cache_item is not None:
@@ -422,6 +448,7 @@ def _make_wrapper(
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    signature_key: bool = False,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]]:
     if jitter is not None and ttl is None:
         raise ValueError("jitter requires ttl to be set")
@@ -431,6 +458,11 @@ def _make_wrapper(
         raise TypeError("key must be callable")
     if key is not None and typed:
         raise ValueError("typed is ignored when a custom key callable is provided")
+    if key is not None and signature_key:
+        raise ValueError(
+            "signature_key cannot be combined with a custom key callable; "
+            "the custom key fully defines cache identity"
+        )
 
     def wrapper(fn: _CBP[_R]) -> _LRUCacheWrapper[_R]:
         origin = fn
@@ -444,7 +476,22 @@ def _make_wrapper(
         if hasattr(fn, "_make_unbound_method"):
             fn = fn._make_unbound_method()
 
-        wrapper = _LRUCacheWrapper(cast(_CB[_R], fn), maxsize, typed, ttl, jitter, key)
+        signature: inspect.Signature | None = None
+        if signature_key:
+            # Resolve once, at decoration time.  Builtins/other objects
+            # without an inspectable signature fail here instead of
+            # producing a silently un-normalized cache.
+            signature = inspect.signature(cast(Callable[..., Any], fn))
+
+        wrapper = _LRUCacheWrapper(
+            cast(_CB[_R], fn),
+            maxsize,
+            typed,
+            ttl,
+            jitter,
+            key,
+            signature,
+        )
         if sys.version_info >= (3, 12):
             wrapper = inspect.markcoroutinefunction(wrapper)
         return wrapper
@@ -460,6 +507,7 @@ def alru_cache(
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    signature_key: bool = False,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]]:
     ...
 
@@ -479,13 +527,16 @@ def alru_cache(
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    signature_key: bool = False,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]] | _LRUCacheWrapper[_R]:
     if maxsize is None or isinstance(maxsize, int):
-        return _make_wrapper(maxsize, typed, ttl, jitter, key)
+        return _make_wrapper(maxsize, typed, ttl, jitter, key, signature_key)
     else:
         fn = cast(_CB[_R], maxsize)
 
         if callable(fn) or hasattr(fn, "_make_unbound_method"):
-            return _make_wrapper(128, False, None, None)(fn)
+            return _make_wrapper(128, typed, ttl, jitter, key, signature_key)(
+                fn
+            )
 
         raise NotImplementedError(f"{fn!r} decorating is not supported")
