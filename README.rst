@@ -147,6 +147,32 @@ instance as its first argument. Passing ``typed=True`` together with ``key``
 raises ``ValueError``, since ``typed`` only affects the default key
 computation.
 
+Recursive wait detection
+------------------------
+
+A cached coroutine can inadvertently wait for itself: while key ``a`` is still
+being computed, that computation calls a cached function for key ``b``, whose
+computation then asks for key ``a``. Pass ``recursive_wait_detection=True`` to
+turn this otherwise pending wait into an immediate ``AlruRecursiveWaitError``.
+
+.. code-block:: python
+
+    @alru_cache(recursive_wait_detection=True)
+    async def load(key):
+        ...
+
+The exception has a ``chain`` attribute containing ``AlruCacheCall`` objects.
+Each object identifies the decorated function and cache key involved in the
+cycle. Detection follows one asyncio causal chain, so two independent callers
+that ask concurrently for the same key still share one computation as usual.
+It also spans different decorated functions and caches. Key descriptions are
+length-limited and never rely on an unbounded user-defined ``repr()``.
+
+Call-chain state is removed when a computation succeeds, fails, is cancelled,
+or its cache entry is invalidated, evicted, expires, or cleared. A later legal
+call after a detected cycle can therefore run normally. ``detect_recursion``
+is accepted as an alias for ``recursive_wait_detection``.
+
 Limitations
 -----------
 

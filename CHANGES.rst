@@ -4,6 +4,11 @@ CHANGES
 
 .. towncrier release notes start
 
+Unreleased
+==========
+
+- Added optional recursive wait detection with the ``recursive_wait_detection`` decorator parameter.
+
 
 2.3.0 (2026-03-18)
 ==================

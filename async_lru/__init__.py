@@ -1,11 +1,12 @@
 import asyncio
+import contextvars
 import dataclasses
 import inspect
 import random
 import sys
 import warnings
 from collections import OrderedDict
-from collections.abc import Callable, Coroutine, Hashable
+from collections.abc import Callable, Coroutine, Hashable, Iterable, Sequence
 from functools import _CacheInfo, _make_key, partial, partialmethod
 from typing import Any, Generic, TypedDict, TypeVar, cast, final, overload
 
@@ -21,7 +22,13 @@ if sys.version_info < (3, 14):
 
 __version__ = "2.3.0"
 
-__all__ = ("AlruCacheLoopResetWarning", "alru_cache")
+__all__ = (
+    "AlruCacheCall",
+    "AlruCacheLoopResetWarning",
+    "AlruRecursionError",
+    "AlruRecursiveWaitError",
+    "alru_cache",
+)
 
 
 _T = TypeVar("_T")
@@ -33,6 +40,182 @@ _CBP = _CB[_R] | partial[_Coro[_R]] | partialmethod[_Coro[_R]]
 
 class AlruCacheLoopResetWarning(UserWarning):
     """Emitted once per cache instance when a loop change triggers an auto-reset."""
+
+
+@final
+@dataclasses.dataclass(frozen=True, slots=True)
+class AlruCacheCall:
+    """A cached function call in a recursive wait diagnostic chain."""
+
+    function: str
+    key: Hashable
+
+    def __repr__(self) -> str:
+        return (
+            f"AlruCacheCall(function={self.function!r}, "
+            f"key={_key_repr(self.key)})"
+        )
+
+
+class AlruRecursiveWaitError(RecursionError):
+    """Raised when a cached computation waits for itself in one causal chain."""
+
+    def __init__(
+        self, calls: Iterable[tuple["_LRUCacheWrapper[Any]", Hashable]]
+    ) -> None:
+        self.chain: tuple[AlruCacheCall, ...] = tuple(
+            AlruCacheCall(_function_label(wrapper), key) for wrapper, key in calls
+        )
+        chain = " -> ".join(
+            f"{call.function}({_key_repr(call.key)})" for call in self.chain
+        )
+        super().__init__(f"Recursive cached call wait detected: {chain}")
+
+
+AlruRecursionError = AlruRecursiveWaitError
+
+
+def _key_repr(key: Hashable, depth: int = 0) -> str:
+    try:
+        key_type = type(key)
+    except Exception:
+        return "<unrepresentable key>"
+    if depth >= 3:
+        return "..."
+    type_name = _type_name(key_type)
+
+    if key_type is str:
+        text_key = cast(str, key)
+        value = (
+            text_key
+            if str.__len__(text_key) <= 70
+            else str.__getitem__(text_key, slice(70)) + "..."
+        )
+        return str.__repr__(value)
+    if key_type is bytes:
+        bytes_key = cast(bytes, key)
+        value = (
+            bytes_key
+            if bytes.__len__(bytes_key) <= 65
+            else bytes.__getitem__(bytes_key, slice(65)) + b"..."
+        )
+        return bytes.__repr__(value)
+    if key_type is bool:
+        return bool.__repr__(cast(bool, key))
+    if key_type is int:
+        int_key = cast(int, key)
+        if int.bit_length(int_key) > 256:
+            return f"<large {type_name} key>"
+        text = int.__repr__(int_key)
+        return text if len(text) <= 80 else text[:77] + "..."
+    if key_type is float:
+        return float.__repr__(cast(float, key))
+    if key is None:
+        return "None"
+    if key_type is type:
+        return f"<class {_type_name(cast(type[Any], key))}>"
+    if key_type is tuple:
+        return _bounded_sequence_repr(
+            cast(Sequence[Hashable], key), "(", ")", depth, allow_comma=True
+        )
+    if (
+        type_name == "_HashedSeq"
+        and getattr(key_type, "__module__", "") == "functools"
+    ):
+        return _bounded_sequence_repr(
+            cast(Sequence[Hashable], key),
+            "functools._HashedSeq[",
+            "]",
+            depth,
+        )
+    return f"<unrepresentable {type_name} key>"
+
+
+def _short_text(value: object, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        text = str.__str__(value)
+        if str.__len__(text) <= limit:
+            return text
+        return str.__getitem__(text, slice(limit - 3)) + "..."
+    except Exception:
+        return None
+
+
+def _type_name(key_type: type[Any]) -> str:
+    try:
+        name = key_type.__qualname__
+    except Exception:
+        try:
+            name = key_type.__name__
+        except Exception:
+            name = "unknown"
+    return _short_text(name, 80) or "unknown"
+
+
+def _bounded_sequence_repr(
+    value: Sequence[Hashable],
+    prefix: str,
+    suffix: str,
+    depth: int,
+    *,
+    allow_comma: bool = False,
+) -> str:
+    parts = []
+    for index, item in enumerate(value):
+        if index == 8:
+            parts.append("...")
+            break
+        parts.append(_key_repr(item, depth + 1))
+    if allow_comma and len(value) == 1:
+        parts.append("")
+    return prefix + ", ".join(parts) + suffix
+
+
+def _function_label(wrapper: "_LRUCacheWrapper[Any]") -> str:
+    try:
+        target: Any = wrapper
+        for _ in range(8):
+            if isinstance(target, (partial, partialmethod)):
+                target = target.func
+                continue
+            wrapped = getattr(target, "__wrapped__", None)
+            if wrapped is not None:
+                target = wrapped
+                continue
+            break
+
+        qualname = getattr(target, "__qualname__", None) or getattr(
+            target, "__name__", None
+        )
+        if qualname is None:
+            qualname = _type_name(type(target))
+        module = getattr(target, "__module__", None)
+        if (
+            module
+            and module != "builtins"
+            and not qualname.startswith(module + ".")
+        ):
+            label = f"{module}.{qualname}"
+        else:
+            label = qualname
+        return _short_text(label, 100) or "unknown cached function"
+    except Exception:
+        return "unknown cached function"
+
+
+@final
+@dataclasses.dataclass(slots=True)
+class _ActiveCacheCall:
+    wrapper: "_LRUCacheWrapper[Any] | None"
+    key: Hashable | None
+    active: bool = True
+
+
+_active_cache_calls: contextvars.ContextVar[tuple[_ActiveCacheCall, ...]] = (
+    contextvars.ContextVar("_active_cache_calls", default=())
+)
 
 
 @final
@@ -49,11 +232,22 @@ class _CacheItem(Generic[_R]):
     task: "asyncio.Task[_R]"
     later_call: asyncio.Handle | None
     waiters: int
+    active_call: _ActiveCacheCall | None = None
 
     def cancel(self) -> None:
         if self.later_call is not None:
             self.later_call.cancel()
-            self.later_call = None
+
+    def deactivate(self) -> None:
+        self.cancel()
+        self.finish_active_call()
+
+    def finish_active_call(self) -> None:
+        if self.active_call is not None:
+            self.active_call.active = False
+            self.active_call.wrapper = None
+            self.active_call.key = None
+            self.active_call = None
 
 
 @final
@@ -71,6 +265,7 @@ class _LRUCacheWrapper(Generic[_R]):
         "__misses",
         "__first_loop",
         "__warned_loop_reset",
+        "__recursive_wait_detection",
         "_is_coroutine",
         "_is_coroutine_marker",
         "__dict__",
@@ -84,6 +279,7 @@ class _LRUCacheWrapper(Generic[_R]):
         ttl: float | None,
         jitter: float | None,
         key: Callable[..., Hashable] | None = None,
+        recursive_wait_detection: bool = False,
     ) -> None:
         try:
             self.__module__ = fn.__module__
@@ -136,6 +332,7 @@ class _LRUCacheWrapper(Generic[_R]):
         self.__misses = 0
         self.__first_loop: asyncio.AbstractEventLoop | None = None
         self.__warned_loop_reset = False
+        self.__recursive_wait_detection = recursive_wait_detection
 
     @property
     def __tasks(self) -> list["asyncio.Task[_R]"]:
@@ -190,16 +387,15 @@ class _LRUCacheWrapper(Generic[_R]):
         if cache_item is None:
             return False
         else:
-            cache_item.cancel()
+            cache_item.deactivate()
             return True
 
     def cache_clear(self) -> None:
         self.__hits = 0
         self.__misses = 0
 
-        for c in self.__cache.values():
-            if c.later_call:
-                c.later_call.cancel()
+        for cache_item in self.__cache.values():
+            cache_item.deactivate()
         self.__cache.clear()
 
     async def cache_close(self, *, wait: bool = False) -> None:
@@ -244,18 +440,45 @@ class _LRUCacheWrapper(Generic[_R]):
         # so asyncio does not set `task.__log_traceback = False` on
         # the false assumption that the caller read the task Exception
         if task.cancelled() or task._exception is not None:
-            self.__cache.pop(key, None)
+            cache_item = self.__cache.pop(key, None)
+            if cache_item is not None:
+                cache_item.deactivate()
             return
 
         cache_item = self.__cache.get(key)
-        if self.__ttl is not None and cache_item is not None:
-            effective_ttl = self.__ttl
-            if self.__jitter is not None:
-                effective_ttl += random.uniform(0, self.__jitter)
-            loop = asyncio.get_running_loop()
-            cache_item.later_call = loop.call_later(
-                effective_ttl, self.__cache.pop, key, None
-            )
+        if cache_item is not None:
+            if self.__ttl is not None:
+                effective_ttl = self.__ttl
+                if self.__jitter is not None:
+                    effective_ttl += random.uniform(0, self.__jitter)
+                loop = asyncio.get_running_loop()
+                cache_item.later_call = loop.call_later(
+                    effective_ttl, self._expire_cache_item, key
+                )
+            cache_item.finish_active_call()
+
+    def _expire_cache_item(self, key: Hashable) -> None:
+        cache_item = self.__cache.pop(key, None)
+        if cache_item is not None:
+            cache_item.deactivate()
+
+    def _recursive_wait(
+        self, cache_item: _CacheItem[Any]
+    ) -> tuple[int, _ActiveCacheCall] | None:
+        active_call = cache_item.active_call
+        if active_call is None or not active_call.active:
+            return None
+
+        chain = _active_cache_calls.get()
+        for index, current_call in enumerate(chain):
+            if (
+                current_call is active_call
+                and current_call.active
+                and current_call.wrapper is not None
+                and current_call.key is not None
+            ):
+                return index, active_call
+        return None
 
     async def _shield_and_handle_cancelled_error(
         self, cache_item: _CacheItem[_T], key: Hashable
@@ -268,7 +491,7 @@ class _LRUCacheWrapper(Generic[_R]):
             # If this is the last waiter and the underlying task is not done,
             # cancel the underlying task and remove the cache entry.
             if cache_item.waiters == 1 and not task.done():
-                cache_item.cancel()  # Cancel TTL expiration
+                cache_item.deactivate()  # Cancel TTL expiration
                 task.cancel()  # Cancel the running coroutine
                 self.__cache.pop(key, None)  # Remove from cache
             raise
@@ -292,6 +515,21 @@ class _LRUCacheWrapper(Generic[_R]):
         if cache_item is not None:
             self._cache_hit(key)
             if not cache_item.task.done():
+                if self.__recursive_wait_detection or _active_cache_calls.get():
+                    recursive_wait = self._recursive_wait(cache_item)
+                    if recursive_wait is not None:
+                        recursive_index, target_call = recursive_wait
+                        diagnostic_chain = tuple(
+                            (current_call.wrapper, current_call.key)
+                            for current_call in _active_cache_calls.get()
+                            if current_call.wrapper is not None
+                            and current_call.key is not None
+                        )
+                        target = (target_call.wrapper, target_call.key)
+                        raise AlruRecursiveWaitError(
+                            (*diagnostic_chain[recursive_index:], target)
+                        )
+
                 # Each logical waiter increments waiters on entry.
                 cache_item.waiters += 1
                 return await self._shield_and_handle_cancelled_error(cache_item, key)
@@ -300,19 +538,37 @@ class _LRUCacheWrapper(Generic[_R]):
             return cache_item.task.result()
 
         coro = self.__wrapped__(*fn_args, **fn_kwargs)
-        task: asyncio.Task[_R] = loop.create_task(coro)
-        task.add_done_callback(partial(self._task_done_callback, key))
+        active_call: _ActiveCacheCall | None = None
+        cache_item: _CacheItem[_R] | None = None
+        token: (
+            contextvars.Token[tuple[_ActiveCacheCall, ...]] | None
+        ) = None
 
-        cache_item = _CacheItem(task, None, 1)
-        self.__cache[key] = cache_item
+        if self.__recursive_wait_detection or _active_cache_calls.get():
+            active_call = _ActiveCacheCall(self, key)
+            token = _active_cache_calls.set(
+                _active_cache_calls.get() + (active_call,)
+            )
 
-        if self.__maxsize is not None and len(self.__cache) > self.__maxsize:
-            dropped_key, dropped_cache_item = self.__cache.popitem(last=False)
-            dropped_cache_item.cancel()
+        try:
+            task: asyncio.Task[_R] = loop.create_task(coro)
+            task.add_done_callback(partial(self._task_done_callback, key))
 
-        self._cache_miss(key)
+            cache_item = _CacheItem(task, None, 1, active_call)
+            self.__cache[key] = cache_item
 
-        return await self._shield_and_handle_cancelled_error(cache_item, key)
+            if self.__maxsize is not None and len(self.__cache) > self.__maxsize:
+                _, dropped_cache_item = self.__cache.popitem(last=False)
+                dropped_cache_item.deactivate()
+
+            self._cache_miss(key)
+
+            return await self._shield_and_handle_cancelled_error(cache_item, key)
+        finally:
+            if active_call is not None and cache_item is None:
+                active_call.active = False
+            if token is not None:
+                _active_cache_calls.reset(token)
 
     def __get__(
         self, instance: _T, owner: type[_T] | None
@@ -422,6 +678,7 @@ def _make_wrapper(
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    recursive_wait_detection: bool = False,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]]:
     if jitter is not None and ttl is None:
         raise ValueError("jitter requires ttl to be set")
@@ -444,7 +701,15 @@ def _make_wrapper(
         if hasattr(fn, "_make_unbound_method"):
             fn = fn._make_unbound_method()
 
-        wrapper = _LRUCacheWrapper(cast(_CB[_R], fn), maxsize, typed, ttl, jitter, key)
+        wrapper = _LRUCacheWrapper(
+            cast(_CB[_R], fn),
+            maxsize,
+            typed,
+            ttl,
+            jitter,
+            key,
+            recursive_wait_detection,
+        )
         if sys.version_info >= (3, 12):
             wrapper = inspect.markcoroutinefunction(wrapper)
         return wrapper
@@ -460,6 +725,8 @@ def alru_cache(
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    recursive_wait_detection: bool = False,
+    detect_recursion: bool | None = None,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]]:
     ...
 
@@ -479,13 +746,32 @@ def alru_cache(
     ttl: float | None = None,
     jitter: float | None = None,
     key: Callable[..., Hashable] | None = None,
+    recursive_wait_detection: bool = False,
+    detect_recursion: bool | None = None,
 ) -> Callable[[_CBP[_R]], _LRUCacheWrapper[_R]] | _LRUCacheWrapper[_R]:
+    if detect_recursion is not None:
+        if recursive_wait_detection:
+            raise ValueError(
+                "detect_recursion is an alias for recursive_wait_detection; "
+                "do not pass both"
+            )
+        recursive_wait_detection = detect_recursion
+
     if maxsize is None or isinstance(maxsize, int):
-        return _make_wrapper(maxsize, typed, ttl, jitter, key)
+        return _make_wrapper(
+            maxsize,
+            typed,
+            ttl,
+            jitter,
+            key,
+            recursive_wait_detection,
+        )
     else:
         fn = cast(_CB[_R], maxsize)
 
         if callable(fn) or hasattr(fn, "_make_unbound_method"):
+            if recursive_wait_detection or detect_recursion is not None:
+                raise ValueError("recursive wait detection requires a called decorator")
             return _make_wrapper(128, False, None, None)(fn)
 
         raise NotImplementedError(f"{fn!r} decorating is not supported")
