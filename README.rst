@@ -147,6 +147,37 @@ instance as its first argument. Passing ``typed=True`` together with ``key``
 raises ``ValueError``, since ``typed`` only affects the default key
 computation.
 
+Signature-normalized keys
+-------------------------
+
+By default, ``f(1)`` and ``f(x=1)`` are different cache keys, just like
+``functools.lru_cache``. Pass ``normalize_key=True`` to bind the arguments
+to the wrapped function's signature first, so equivalent call spellings
+share a single cache entry:
+
+.. code-block:: python
+
+    @alru_cache(normalize_key=True)
+    async def fetch(host, port=8080, mode="a"):
+        ...
+
+    await fetch("example.com")                       # miss
+    await fetch("example.com", 8080)                 # hit
+    await fetch("example.com", port=8080, mode="a")  # hit
+
+Positional-only, keyword-only, ``*args`` and ``**kwargs`` parameters are
+handled, and ``**kwargs`` order does not affect the key. Invalid calls
+raise the same ``TypeError`` the wrapped function would raise.
+``cache_invalidate()`` and ``cache_contains()`` apply the same
+normalization, so any equivalent spelling addresses the same entry.
+
+Argument values are used as-is and never stringified: unhashable values,
+including mutable defaults, raise ``TypeError`` instead of silently
+collapsing into a fake stable key. ``typed=True`` keeps distinct types in
+separate entries (e.g. ``1`` and ``True``). ``normalize_key`` cannot be
+combined with a custom ``key`` callable; passing both raises
+``ValueError``.
+
 Limitations
 -----------
 
